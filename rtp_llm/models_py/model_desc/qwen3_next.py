@@ -1037,6 +1037,15 @@ class Qwen3NextDecoderLayer(nn.Module):
             attn_meta=attn_meta,
         )
 
+        import os
+        if os.environ.get("RTP_LLM_NAN_DEBUG") in ("1", "2") and (hidden_states.shape[0] > 1 or os.environ.get("RTP_LLM_NAN_DEBUG") == "2"):
+            import logging
+            if (~torch.isfinite(hidden_states)).any().item():
+                logging.getLogger("nan_debug").warning(
+                    f"[nan-probe] LAYER {self.layer_idx} attn-out NONFINITE batch={hidden_states.shape[0]} "
+                    f"nan={torch.isnan(hidden_states).sum().item()} inf={torch.isinf(hidden_states).sum().item()}"
+                )
+
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         hidden_states = self.mlp(hidden_states)
@@ -1211,6 +1220,17 @@ class Qwen3NextModel(GptModelBase):
 
         residual = torch.zeros_like(hidden_states)
 
+        import os
+        _nan_debug = os.environ.get("RTP_LLM_NAN_DEBUG") in ("1", "2")
+        if _nan_debug and hidden_states.shape[0] > 1:
+            import logging
+            _nan_dbg_logger = logging.getLogger("nan_debug")
+            _bs = hidden_states.shape[0]
+            _bad = (~torch.isfinite(hidden_states)).any().item()
+            _nan_dbg_logger.warning(
+                f"[nan-probe] embed batch={_bs} prefill={attention_inputs.is_prefill} finite={not _bad}"
+            )
+
         for i, decoder_layer in enumerate(self.layers):
             layer_attention_inputs = select_attention_inputs_for_layer(
                 inputs, self.kv_cache, i
@@ -1228,6 +1248,15 @@ class Qwen3NextModel(GptModelBase):
                 attention_inputs=layer_attention_inputs,
                 attn_meta=attn_meta,
             )
+            if _nan_debug:
+                _bad = (~torch.isfinite(hidden_states)).any().item()
+                if _bad:
+                    _nan_dbg_logger.warning(
+                        f"[nan-probe] LAYER {i} batch={_bs} prefill={attention_inputs.is_prefill} "
+                        f"NONFINITE detected: nan={torch.isnan(hidden_states).sum().item()} "
+                        f"inf={torch.isinf(hidden_states).sum().item()}"
+                    )
+                    break
 
         hidden_states, residual = self.norm(hidden_states, residual)
         return PyModelOutputs(hidden_states)

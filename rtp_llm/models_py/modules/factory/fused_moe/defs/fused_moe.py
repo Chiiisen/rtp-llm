@@ -288,6 +288,41 @@ class FusedMoe(torch.nn.Module):
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 extra_expert_args=extra_expert_args,
             )
+            import os
+            if os.environ.get("RTP_LLM_NAN_DEBUG") in ("1", "2") and (hidden_states.shape[0] > 1 or os.environ.get("RTP_LLM_NAN_DEBUG") == "2"):
+                import logging
+                _out = combine_payload.fused_expert_output
+                if (~torch.isfinite(_out)).any().item():
+                    logging.getLogger("nan_debug").warning(
+                        f"[exec-probe] executor OUTPUT NONFINITE batch={hidden_states.shape[0]} "
+                        f"exec_x={tuple(expert_payload.expert_x.shape)} ids={tuple(expert_payload.expert_topk_ids.shape)} "
+                        f"nan={torch.isnan(_out.float()).sum().item()} inf={torch.isinf(_out.float()).sum().item()}"
+                    )
+                    torch.save(
+                        {
+                            "exec_x": expert_payload.expert_x.detach().clone(),
+                            "exec_ids": expert_payload.expert_topk_ids.detach().clone(),
+                            "exec_w": expert_payload.expert_topk_weights.detach().clone(),
+                            "exec_out": _out.detach().clone(),
+                            "a1": hidden_states.detach().clone(),
+                        },
+                        f"/data/xuezhichen.xzc/RTP-LLM/tmp_tests/exec_capture_r{os.getpid()}.pt",
+                    )
+                    # re-run the SAME executor call once: deterministic-in-engine vs one-off
+                    _retry = self.fused_experts.execute(
+                        expert_payload,
+                        activation=activation,
+                        expert_map=expert_map,
+                        a2_scale=a2_scale,
+                        apply_router_weight_on_input=apply_router_weight_on_input,
+                        extra_expert_args=extra_expert_args,
+                    )
+                    _retry_out = _retry.fused_expert_output
+                    logging.getLogger("nan_debug").warning(
+                        f"[exec-probe] RERUN: nan={torch.isnan(_retry_out.float()).sum().item()} "
+                        f"inf={torch.isinf(_retry_out.float()).sum().item()} "
+                        f"absmax={_retry_out.float().abs().max().item():.5f}"
+                    )
 
         # Finalize arguments are a private per-call protocol. Copy caller
         # input before adding derived values so a reusable dict cannot retain

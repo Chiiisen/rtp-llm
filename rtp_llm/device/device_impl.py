@@ -647,8 +647,13 @@ class CudaImpl(GpuImpl):
             return kernel, scale
 
         if self.py_env_configs.moe_config.fp4_moe_op == "cutedsl":
-            # cutedsl moe needs gate+up format for w13
-            if kernel_name == W.moe_w1:
+            # The SM120 executor falls back to FlashInfer CUTLASS, whose gated
+            # activation reads w13 as [up; gate]. The Qwen loaders already
+            # produce that order. CuTeDSL on other architectures expects
+            # [gate; up], so only that path needs the half swap.
+            from rtp_llm.models_py.utils.arch import is_sm12x
+
+            if kernel_name == W.moe_w1 and not is_sm12x(kernel.device):
                 kernel = torch.cat(
                     [
                         kernel[:, kernel.shape[1] // 2 :, :],

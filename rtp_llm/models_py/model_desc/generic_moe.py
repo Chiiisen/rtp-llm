@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Dict, Optional
 
 import torch
@@ -32,6 +33,9 @@ from rtp_llm.ops.compute_ops import LayerKVCache, PyModelInputs, PyModelOutputs
 from rtp_llm.utils.model_weight import W
 
 logger = logging.getLogger(__name__)
+
+
+_NAN_DUMP_DONE = False
 
 
 class GenericMoeLayer(nn.Module):
@@ -168,6 +172,8 @@ class GenericMoeLayer(nn.Module):
         return shared_expert_output
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        import os
+        _moe_probe = os.environ.get("RTP_LLM_NAN_DEBUG") in ("1", "2") and (hidden_states.shape[0] > 1 or os.environ.get("RTP_LLM_NAN_DEBUG") == "2")
         num_tokens, _ = hidden_states.shape
         router_logits = self.gate(hidden_states)
         router_logits_fp32 = router_logits.float()
@@ -223,6 +229,68 @@ class GenericMoeLayer(nn.Module):
             activation="SiGLU",
             skip_tp_allreduce=self.use_unified_tp_allreduce,
         )
+        if _moe_probe:
+            import logging
+            _in_bad = (~torch.isfinite(hidden_states)).any().item()
+            _out_bad = (~torch.isfinite(experts_output)).any().item()
+            _in_abs = hidden_states.float().abs().max().item()
+            _log = logging.getLogger("nan_debug")
+            _log.warning(
+                f"[moe-probe] batch={num_tokens} in_bad={_in_bad} in_absmax={_in_abs:.2f} "
+                f"out_bad={_out_bad} router_finite={torch.isfinite(router_logits_fp32).all().item()} "
+                f"topk_ids_finite={torch.isfinite(topk_ids.float()).all().item()}"
+            )
+            global _NAN_DUMP_DONE
+            if not _NAN_DUMP_DONE:
+                _NAN_DUMP_DONE = True
+                try:
+                    ex = self.fused_moe.fused_experts
+                    torch.save(
+                        {
+                            "w1": ex.w1,
+                            "w2": ex.w2,
+                            "w1_scale": ex.w1_scale,
+                            "w2_scale": ex.w2_scale,
+                            "g1_alphas": ex.g1_alphas,
+                            "g2_alphas": ex.g2_alphas,
+                            "expert_x_scale": ex.expert_x_scale,
+                            "expert_x2_scale": ex.expert_x2_scale,
+                        },
+                        f"/data/xuezhichen.xzc/RTP-LLM/tmp_tests/moe_exec_tensors_r{os.getpid()}.pt",
+                    )
+                    _log.warning("[moe-probe] executor tensors dumped")
+                except Exception as _e:
+                    _log.warning(f"[moe-probe] executor dump failed: {_e}")
+            try:
+                ex = self.fused_moe.fused_experts
+                _ck_now = (
+                    int(ex.w1.view(torch.int64).sum().item()),
+                    int(ex.w2.view(torch.int64).sum().item()),
+                    int(ex.w1_scale.view(torch.int64).sum().item()),
+                    int(ex.w2_scale.view(torch.int64).sum().item()),
+                )
+                if not hasattr(self, "_nan_ck0"):
+                    self._nan_ck0 = _ck_now
+                elif self._nan_ck0 != _ck_now:
+                    import logging
+                    logging.getLogger("nan_debug").warning(
+                        f"[moe-probe] WEIGHT STOMP on this layer: was={self._nan_ck0} now={_ck_now}"
+                    )
+                    self._nan_ck0 = _ck_now
+            except Exception:
+                pass
+            if _out_bad:
+                _cap = {
+                    "moe_in": hidden_states.detach().clone(),
+                    "moe_out": experts_output.detach().clone(),
+                    "topk_ids": topk_ids.detach().clone(),
+                    "topk_w": topk_weights.detach().clone(),
+                }
+                torch.save(_cap, f"/data/xuezhichen.xzc/RTP-LLM/tmp_tests/nan_moe_capture_{num_tokens}.pt")
+                _log.warning(
+                    f"[moe-probe] saved capture: nan={torch.isnan(experts_output).sum().item()} "
+                    f"inf={torch.isinf(experts_output).sum().item()} out_absmax_pre={experts_output.float().abs().max().item():.2f}"
+                )
         if self.shared_expert is not None:
             shared_expert_output = self.shared_expert(
                 hidden_states,
@@ -412,6 +480,12 @@ class GenericMoeModel(GptModelBase):
         self.norm = RMSResNorm(
             weights.get_global_weight(W.final_ln_gamma), eps=model_config.layernorm_eps
         )
+        self._mtp_target_hidden_states: Optional[torch.Tensor] = None
+        self._capture_eagle3 = (
+            getattr(model_config, "hc_mult", 1) == 3
+            or os.environ.get("SP_TYPE", "").strip().lower() == "eagle3"
+        )
+        self._eagle3_capture_logged = False
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
         input_ids: torch.Tensor = inputs.input_ids
@@ -421,6 +495,7 @@ class GenericMoeModel(GptModelBase):
                 inputs
             )  # pyright: ignore[reportUnreachable]
         residual = torch.zeros_like(hidden_states)
+        eagle3_hidden = []
         for i, decoder_layer in enumerate(self.layers[: self.layer_num]):
             layer_fmha_impl = select_fmha_impl_for_layer(fmha_impl, self.kv_cache, i)
             output = decoder_layer(
@@ -431,10 +506,35 @@ class GenericMoeModel(GptModelBase):
             )
             hidden_states = output.hidden_states
             residual = output.residual
+            if self._capture_eagle3 and i in (1, 46, 90):
+                eagle3_hidden.append((hidden_states + residual).contiguous())
 
         hidden_states, _ = self.norm(hidden_states, residual)
 
+        if len(eagle3_hidden) == 3:
+            self._mtp_target_hidden_states = torch.cat(eagle3_hidden, dim=-1)
+        else:
+            self._mtp_target_hidden_states = None
+        if self._capture_eagle3 and not self._eagle3_capture_logged:
+            logging.info(
+                "EAGLE3 target hidden capture: hc_mult=%s, layers=%s, shape=%s",
+                getattr(self.config, "hc_mult", None),
+                len(eagle3_hidden),
+                tuple(self._mtp_target_hidden_states.shape)
+                if self._mtp_target_hidden_states is not None
+                else None,
+            )
+            self._eagle3_capture_logged = True
+
         return PyModelOutputs(hidden_states)
+
+    def get_mtp_target_hidden_states(self, num_tokens: int = -1) -> Optional[torch.Tensor]:
+        hidden_states = self._mtp_target_hidden_states
+        if hidden_states is None:
+            return None
+        if num_tokens < 0:
+            return hidden_states
+        return hidden_states.narrow(0, 0, min(num_tokens, hidden_states.size(0)))
 
 
 __all__ = [

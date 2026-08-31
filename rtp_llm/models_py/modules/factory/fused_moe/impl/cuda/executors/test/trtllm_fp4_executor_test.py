@@ -1,5 +1,7 @@
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from flashinfer import (
@@ -82,6 +84,38 @@ class moe_args:
 
 
 cache_permute_indices = dict()
+
+
+class SM120CutlassWeightLayoutTest(unittest.TestCase):
+    def _prepare(self, is_sm120):
+        impl = SimpleNamespace(
+            py_env_configs=SimpleNamespace(
+                moe_config=SimpleNamespace(fp4_moe_op="cutedsl")
+            ),
+            swizzle_blockscale=lambda scale: scale,
+        )
+        up = torch.full((1, 2, 1), 1, dtype=torch.uint8)
+        gate = torch.full((1, 2, 1), 2, dtype=torch.uint8)
+        kernel = torch.cat((up, gate), dim=1)
+        scale = kernel.to(torch.float32)
+        with mock.patch(
+            "rtp_llm.models_py.utils.arch.is_sm12x", return_value=is_sm120
+        ):
+            return CudaImpl.maybe_prepare_static_weights_for_fp4_moe(
+                impl, W.moe_w1, W.moe_s1, kernel, scale
+            )
+
+    def test_sm120_cutlass_keeps_up_gate_layout(self):
+        kernel, scale = self._prepare(is_sm120=True)
+        self.assertEqual(kernel[:, :2].unique().item(), 1)
+        self.assertEqual(kernel[:, 2:].unique().item(), 2)
+        torch.testing.assert_close(scale, kernel.to(scale.dtype))
+
+    def test_other_cutedsl_arch_swaps_to_gate_up_layout(self):
+        kernel, scale = self._prepare(is_sm120=False)
+        self.assertEqual(kernel[:, :2].unique().item(), 2)
+        self.assertEqual(kernel[:, 2:].unique().item(), 1)
+        torch.testing.assert_close(scale, kernel.to(scale.dtype))
 
 
 class FP4Moe:
