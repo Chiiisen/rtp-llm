@@ -186,6 +186,25 @@ class Qwen3MoeEagle3(QWenV2):
     def get_weight_cls():
         return Qwen3MoeEagle3Weight
 
+    def _create_python_model(self):
+        from rtp_llm.models_py.model_desc.qwen3_moe_eagle3 import Qwen3MoeEagle3Model
+
+        # The draft model uses 64-wide attention heads while the target uses 128.
+        self.model_config.attn_config.rope_config.dim = (
+            self.model_config.attn_config.size_per_head
+        )
+        self.py_model = Qwen3MoeEagle3Model(
+            self.model_config,
+            self.parallelism_config,
+            self.weight,
+            max_generate_batch_size=self.max_generate_batch_size,
+            moe_config=self.moe_config,
+            fmha_config=self.fmha_config,
+            py_hw_kernel_config=self.hw_kernel_config,
+            device_resource_config=self.device_resource_config,
+        )
+        return self.py_model
+
 
 register_model("qwen_3_moe", Qwen3Moe, ["Qwen3MoeForCausalLM"])
 register_model("qwen_3_moe_eagle3", Qwen3MoeEagle3, ["Qwen3MoeForCausalLMEagle"])

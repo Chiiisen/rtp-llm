@@ -225,11 +225,30 @@ void MtpExecutor::maybeOverrideLastHiddenWithMtpBuffer(GptModelInputs& model_inp
     }
 }
 
-void MtpExecutor::maybeOverrideLastHiddenWithMtpBuffer(GptModelOutputs& model_output, ModelBase& source) {
-    if (!model_output.all_hidden_states.defined() || model_output.all_hidden_states.size(0) == 0) {
-        return;
+void MtpExecutor::maybeOverrideLastHiddenWithMtpBuffer(GptModelOutputs& model_output,
+                                                       ModelBase&       source,
+                                                       int64_t          hidden_rows) {
+    if (hidden_rows == 0) {
+        if (!model_output.all_hidden_states.defined() || model_output.all_hidden_states.size(0) == 0) {
+            return;
+        }
+        hidden_rows = model_output.all_hidden_states.size(0);
     }
-    auto pre_hc = source.getMtpTargetHiddenStates(model_output.all_hidden_states.size(0));
+    auto pre_hc = source.getMtpTargetHiddenStates(hidden_rows);
+    static bool handoff_shape_logged = false;
+    if (!handoff_shape_logged) {
+        RTP_LLM_LOG_INFO("[EAGLE3 hidden handoff] requested_rows=%ld, source=[%ld,%ld], fallback=[%ld,%ld]",
+                         hidden_rows,
+                         pre_hc.defined() && pre_hc.dim() > 0 ? pre_hc.size(0) : -1,
+                         pre_hc.defined() && pre_hc.dim() > 1 ? pre_hc.size(1) : -1,
+                         model_output.all_hidden_states.defined() && model_output.all_hidden_states.dim() > 0 ?
+                             model_output.all_hidden_states.size(0) :
+                             -1,
+                         model_output.all_hidden_states.defined() && model_output.all_hidden_states.dim() > 1 ?
+                             model_output.all_hidden_states.size(1) :
+                             -1);
+        handoff_shape_logged = true;
+    }
     if (pre_hc.defined() && pre_hc.numel() > 0) {
         model_output.all_hidden_states = pre_hc;
     }
@@ -750,6 +769,7 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         model_output          = std::move(forwardModel(model_.get(), model_input, ModelInputsModelRole::TARGET));
         model_forward_us += autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+        maybeOverrideLastHiddenWithMtpBuffer(model_output, *model_, model_input.combo_tokens.numel());
     }
 
     // eplb
@@ -1384,6 +1404,7 @@ GptModelOutputs MtpExecutor::runTargetVerifyForward(GptModelInputs& model_input,
 
     ensureModelInputsOnCuda(model_input, "decode.target_verify_forward");
     GptModelOutputs model_output = forwardModel(model_.get(), model_input, ModelInputsModelRole::TARGET);
+    maybeOverrideLastHiddenWithMtpBuffer(model_output, *model_, model_input.combo_tokens.numel());
     RTP_LLM_LOG_DEBUG("[MTP decode] target model verify forward end");
     model_input.is_target_verify = false;
     return model_output;

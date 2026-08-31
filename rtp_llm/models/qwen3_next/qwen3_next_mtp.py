@@ -1,5 +1,7 @@
 from typing import Any, Dict, List, Optional
 
+import logging
+
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.model_factory_register import register_model
 from rtp_llm.model_loader.model_weight_info import ModelWeightInfo
@@ -113,6 +115,28 @@ class Qwen3NextMTPMixin:
             [HybridAttentionType.NONE],
             KVCacheSpecType.MHA,
         )
+        # MTP layers are commonly excluded from checkpoint quantization (e.g.
+        # nv-community NVFP4 checkpoints list `mtp*` in quantization_config.ignore
+        # and keep the draft weights BF16). Drop the quant config inherited from
+        # the main-model checkpoint in that case so the draft runs unquantized
+        # instead of selecting an FP4 MoE strategy without scales.
+        quant_config = getattr(model_config, "quant_config", None)
+        if quant_config is not None:
+            import fnmatch
+
+            excludes = getattr(quant_config, "exclude_modules", None) or set()
+            probe = "mtp.layers.0.mlp.experts.0.gate_proj.weight"
+            if any(fnmatch.fnmatch(probe, pat) for pat in excludes):
+                logging.info(
+                    "MTP weights are excluded from checkpoint quantization; "
+                    "running draft model unquantized"
+                )
+                model_config.quant_config = None
+                # Reset quant_algo too: model_weight_info uses quant_algo.isQuant()
+                # to decide whether to wrap weights with quant modules.
+                from rtp_llm.ops import QuantAlgo
+
+                model_config.quant_algo = QuantAlgo()
 
     def _create_python_model(self) -> Optional[Any]:
         from rtp_llm.models_py.model_desc.qwen3_next_mtp import Qwen3NextMTPModel

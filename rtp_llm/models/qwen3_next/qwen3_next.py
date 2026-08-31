@@ -98,7 +98,10 @@ class Qwen3NextBase(BaseModel):
         config.expert_num = config_json["num_experts"]
         config.moe_inter_size = config_json["moe_intermediate_size"]
         config.inter_size = config_json["shared_expert_intermediate_size"]
-        config.has_moe_norm = config_json.get("norm_topk_prob", True)  # 默认 True
+        # norm_topk_prob absent in nv-community NVFP4 checkpoints; Qwen3.5
+        # (Qwen3-Next arch) HF default is False — renormalizing inflates the
+        # MoE output by 1/sum(w) per layer and compounds across layers.
+        config.has_moe_norm = config_json.get("norm_topk_prob", False)
         config.moe_style = 2  # shared + expert
 
         moe_step = config_json.get("decoder_sparse_step", 1)

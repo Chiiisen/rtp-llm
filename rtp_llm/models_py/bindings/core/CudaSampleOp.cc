@@ -11,6 +11,7 @@
 #include "rtp_llm/models_py/bindings/common/kernels/vocab_prune/mapping.h"
 #include "rtp_llm/models_py/bindings/cuda/kernels/speculative_sampling/sampling.h"
 #include "rtp_llm/cpp/utils/DebugUtils.h"
+#include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/models_py/bindings/cuda/kernels/sampling/sampling.h"
 #include "3rdparty/flashinfer/flashinfer.h"
 #include <cstddef>
@@ -397,6 +398,45 @@ static GreedyOutput flashinferSampleGreedy(const GreedyParams& params, const tor
     auto transposed_t = transposed_tokens.transpose(0, 1).contiguous();
     params.token_ids.copy_(transposed_t, true);
     check_cuda_error();
+
+    // SM120 batch>1 diagnosis: on failure dump everything that splits the
+    // hypothesis space (garbage logits vs kernel failure vs params) in one shot.
+    if (success.defined()) {
+        auto success_dbg = success.to(torch::kCPU, /*non_blocking=*/false);
+        const auto* s    = success_dbg.data_ptr<bool>();
+        bool any_false   = false;
+        for (int64_t i = 0; i < batch_size; ++i) {
+            if (!s[i]) {
+                any_false = true;
+                break;
+            }
+        }
+        if (any_false || batch_size > 1) {
+            auto  probs_finite = torch::isfinite(probs_t).all().item<bool>();
+            auto  probs_sum    = probs_t.sum(-1);
+            float sum_min      = probs_sum.min().item<float>();
+            float sum_max      = probs_sum.max().item<float>();
+            std::string succ_str;
+            for (int64_t i = 0; i < batch_size; ++i) {
+                succ_str += s[i] ? "1" : "0";
+            }
+            RTP_LLM_LOG_WARNING(
+                        "[sampler-diag] batch=%ld vocab=%ld success=%s probs_finite=%s "
+                        "probs_sum=[%.6f..%.6f] all_top_k_one=%d all_top_k_no_limit=%d all_top_p_one=%d "
+                        "logits_dtype=%d logits_device=%s",
+                        (long)batch_size,
+                        (long)params.logits.size(1),
+                        succ_str.c_str(),
+                        probs_finite ? "true" : "false",
+                        sum_min,
+                        sum_max,
+                        (int)all_top_k_one,
+                        (int)all_top_k_no_limit,
+                        (int)all_top_p_one,
+                        (int)params.logits.scalar_type(),
+                        params.logits.device().str().c_str());
+        }
+    }
     return {success};
 }
 

@@ -13,7 +13,12 @@ import flashinfer.rope as rope
 import torch
 from flashinfer import get_batch_indices_positions, get_seq_lens
 
-from rtp_llm.ops import RopeConfig, get_rope_cache_once
+from rtp_llm.ops import (
+    RopeConfig,
+    check_rope_cache,
+    get_rope_cache,
+    get_rope_cache_once,
+)
 
 
 class BaseRotaryEmbeddingOp(ABC):
@@ -63,7 +68,14 @@ class BaseRotaryEmbeddingOp(ABC):
                 rope_cache = get_rope_cache_once(
                     rope_config, max_position_embeddings, is_cuda=True, interleave=False
                 )
-                self.cos_sin_cache = rope_cache.data
+                if check_rope_cache(rope_config, rope_cache):
+                    self.cos_sin_cache = rope_cache.data
+                else:
+                    # Target and speculative models can use different RoPE
+                    # dimensions in the same process (for example 128 vs 64).
+                    self.cos_sin_cache = get_rope_cache(
+                        rope_config, max_position_embeddings, False
+                    )
             except Exception:
                 # If get_rope_cache_once fails, fallback to dynamic computation in _apply_rope
                 self.cos_sin_cache = None

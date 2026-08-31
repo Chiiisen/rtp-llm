@@ -461,6 +461,7 @@ GptModelOutputs PyWrappedModel::callForwardPostLayers(torch::Tensor         hidd
                                                       size_t                num_valid_tokens) {
     RTP_LLM_PROFILE_SCOPE("py_model.callForwardPostLayers");
     size_t num_input_tokens = num_valid_tokens != -1 ? num_valid_tokens : inputs.combo_tokens.size(0);
+    auto   mtp_target_hidden = getMtpTargetHiddenStates(num_input_tokens);
     return forwardPostLayers(hidden_states,
                              inputs.input_lengths.size(0) != inputs.sequence_lengths.size(0),
                              inputs.need_all_logits,
@@ -468,7 +469,7 @@ GptModelOutputs PyWrappedModel::callForwardPostLayers(torch::Tensor         hidd
                              false,
                              num_input_tokens,
                              inputs,
-                             torch::Tensor(),
+                             mtp_target_hidden,
                              skip_final_layernorm);
 }
 

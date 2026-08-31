@@ -1063,3 +1063,123 @@ TEST_F(CudaSamplerTest, testDoSample) {
                             step,
                             10);
 }
+
+// Engine decode recipe that failed on SM120 at batch>1 (514 sampler generate
+// token id failed): GenerateConfig defaults leave do_sample=true, top_k=0
+// (no limit), top_p=1.0 -> flashinferSampleGreedy takes the
+// top_p_sampling_from_probs branch with per-row seed/offset arrays.
+// Mirrors Sampler.cc persistent-buffer slicing.
+TEST_F(CudaSamplerTest, testGreedyBatchTopPNoLimitEngineRecipe) {
+    const int64_t vocab_size = 1000;
+    for (int64_t batch_size : {int64_t(1), int64_t(2), int64_t(4)}) {
+        auto logits_t = normalizedRandomProbs(batch_size, vocab_size);
+
+        size_t step = 0;
+        // token_ids [batch, step + 1] — arbitrary history values
+        auto output_token_ids_t =
+            torch::zeros({batch_size, (int64_t)step + 1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+        auto sequence_lengths_t =
+            torch::full({batch_size}, (int64_t)step, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+        auto input_lengths_t =
+            torch::full({batch_size}, (int64_t)-1, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+
+        // GenerateConfig defaults through the OpenAI layer: do_sample=true,
+        // top_k=0 (no limit), top_p=1.0, temperature=1.0
+        auto top_k_t      = torch::zeros({batch_size}, torch::TensorOptions().dtype(torch::kInt32).pinned_memory(true));
+        auto top_p_t      = torch::ones({batch_size}, torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
+        auto temperture_t = torch::ones({batch_size}, torch::TensorOptions().dtype(torch::kFloat32).pinned_memory(true));
+        auto do_sample_t  = torch::ones({batch_size}, torch::TensorOptions().dtype(torch::kBool).pinned_memory(true));
+
+        std::vector<at::Generator> generator;
+        for (int64_t i = 0; i < batch_size; i++) {
+            generator.push_back(torch::make_generator<at::CUDAGeneratorImpl>());
+            generator[i].set_current_seed(i + 1);
+        }
+
+        // Persistent buffers exactly as Sampler.cc allocateGreedySamplingBuffers
+        auto pinned_i64 = torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true);
+        GreedySamplingBuffers buffers;
+        buffers.seed_host            = torch::empty({batch_size}, pinned_i64);
+        buffers.offset_host          = torch::empty({batch_size}, pinned_i64);
+        buffers.output_ids_ptrs_host = torch::empty({batch_size}, pinned_i64);
+        buffers.max_batch_size       = batch_size;
+
+        GreedyParams params({logits_t,
+                             input_lengths_t,
+                             sequence_lengths_t,
+                             output_token_ids_t,
+                             step,
+                             top_k_t,
+                             top_p_t,
+                             temperture_t,
+                             nullopt,
+                             nullopt,
+                             nullopt,
+                             nullopt,
+                             false,
+                             nullopt,
+                             nullopt,
+                             nullopt,
+                             do_sample_t,
+                             generator,
+                             &buffers});
+        auto greedy_output = execSampleGreedy(params);
+        check_cuda_error();
+        cudaDeviceSynchronize();
+
+        if (greedy_output.success.defined()) {
+            auto success_host = greedy_output.success.cpu();
+            auto* success_ptr = success_host.data_ptr<bool>();
+            for (int64_t i = 0; i < batch_size; ++i) {
+                ASSERT_TRUE(success_ptr[i]) << "batch_size=" << batch_size << " row " << i << " success=false";
+            }
+        }
+        auto tokens_host = toHostInt(output_token_ids_t);
+        for (int64_t i = 0; i < batch_size; ++i) {
+            const auto token = tokens_host[i * (step + 1) + step];
+            ASSERT_GE(token, 0) << "batch_size=" << batch_size << " row " << i;
+            ASSERT_LT(token, vocab_size) << "batch_size=" << batch_size << " row " << i;
+        }
+        std::cout << "[engine-recipe] batch=" << batch_size << " ok" << std::endl;
+    }
+}
+
+// Direct-kernel variant of the same branch: top_p_sampling_from_probs with
+// per-row seed/offset arrays, scalar top_p=1.0, deterministic=true — isolates
+// kernel-vs-engine (persistent buffers / generators).
+TEST_F(CudaSamplerTest, testTopPPerRowSeedOffsetBatchSweep) {
+    const int64_t vocab_size = 1000;
+    auto          stream     = at::cuda::getCurrentCUDAStream().stream();
+    for (int64_t batch_size : {int64_t(1), int64_t(2), int64_t(4), int64_t(8)}) {
+        auto probs   = normalizedRandomProbs(batch_size, vocab_size);
+        auto output  = torch::empty({batch_size}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+        auto valid   = torch::empty({batch_size}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA));
+        auto seed_d  = torch::empty({batch_size}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+        auto offset_d = torch::empty({batch_size}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+        for (int64_t i = 0; i < batch_size; ++i) {
+            seed_d[i]   = (int64_t)(20260706 + i * 7919);
+            offset_d[i] = (int64_t)(128 + i * 32);
+        }
+
+        rtp_llm::top_p_sampling_from_probs(probs,
+                                           output,
+                                           valid,
+                                           std::nullopt,
+                                           std::nullopt,
+                                           1.0,
+                                           true,
+                                           seed_d,
+                                           0,
+                                           offset_d,
+                                           0,
+                                           (int64_t)stream);
+        cudaDeviceSynchronize();
+        assertAllValid(valid);
+        auto output_host = toHostInt(output);
+        for (int64_t i = 0; i < batch_size; ++i) {
+            ASSERT_GE(output_host[i], 0);
+            ASSERT_LT(output_host[i], vocab_size);
+        }
+        std::cout << "[topp-per-row] batch=" << batch_size << " ok" << std::endl;
+    }
+}

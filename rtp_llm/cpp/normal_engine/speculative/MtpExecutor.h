@@ -90,7 +90,9 @@ protected:
     void maybeOverrideLastHiddenWithMtpBuffer(GptModelInputs& model_input,
                                               ModelBase&      source,
                                               bool            request_actual_rows = false);
-    void maybeOverrideLastHiddenWithMtpBuffer(GptModelOutputs& model_output, ModelBase& source);
+    void maybeOverrideLastHiddenWithMtpBuffer(GptModelOutputs& model_output,
+                                              ModelBase&       source,
+                                              int64_t          hidden_rows = 0);
 
     void maybePrintModelInput(const GptModelInputs& model_input, const std::string& prefix) const;
 

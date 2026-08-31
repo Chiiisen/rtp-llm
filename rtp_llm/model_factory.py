@@ -171,6 +171,8 @@ class ModelFactory:
                 merge_lora=False,  # Propose model doesn't need merge_lora
                 loader_recycle_handles=engine_config.load_config.loader_recycle_handles,
                 moe_pure_tp_preshard=engine_config.load_config.moe_pure_tp_preshard,
+                # EAGLE3 uses a dedicated one-layer Python draft model.
+                skip_python_model=False,
             )
             logging.info(f"create propose model {engine_config.sp_config.type}")
             return ProposeModel(sp_type, gen_num_per_circle, gpt_model)
@@ -380,14 +382,18 @@ class ModelFactory:
         if not sp_config.checkpoint_path:
             return None
 
-        # Current SP engine only supports MTP and EAGLE
-        if sp_config.type not in [SpeculativeType.MTP, SpeculativeType.EAGLE]:
+        # Current SP engine supports MTP, EAGLE, and EAGLE3.
+        if sp_config.type not in [
+            SpeculativeType.MTP,
+            SpeculativeType.EAGLE,
+            SpeculativeType.EAGLE3,
+        ]:
             logging.error(
-                "Speculative engine only supports MTP and EAGLE, but got %s",
+                "Speculative engine only supports MTP, EAGLE, and EAGLE3, but got %s",
                 sp_config.type.name,
             )
             raise ValueError(
-                "Speculative engine only supports MTP and EAGLE, but got %s"
+                "Speculative engine only supports MTP, EAGLE, and EAGLE3, but got %s"
                 % sp_config.type.name
             )
 
@@ -423,5 +429,9 @@ class ModelFactory:
             embedding_config=None,  # Propose model doesn't need embedding_config
         )
         propose_model_cls._post_build_model_config(propose_model_config)
+
+        # Qwen EAGLE3 consumes three selected target-layer hidden states.
+        if sp_config.type == SpeculativeType.EAGLE3:
+            model_config.hc_mult = 3
 
         return propose_model_config
