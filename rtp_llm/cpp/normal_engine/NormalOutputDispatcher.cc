@@ -153,6 +153,14 @@ void NormalOutputDispatcher::dispatchSingleStream(GenerateStreamPtr    stream,
     const auto&  new_all_token_ids = token_ids_cpu;
     const size_t token_stride      = new_all_token_ids.size(1);
 
+    if (stream->isChunkedPrefillMid()) {
+        // Mid-chunk context pass: the forward wrote this chunk's KV; no token
+        // is sampled or committed. The sampler row for this stream is
+        // discarded and the chunk cursor advances for the next round.
+        stream->advanceChunkedPrefill();
+        return;
+    }
+
     auto cur_batch_size  = stream->currentBatchSize();
     auto next_batch_size = stream->nextBatchSize();
     auto token_size      = stream->currentExecuteTokenSize();

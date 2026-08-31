@@ -405,7 +405,10 @@ absl::Status StreamCacheResource::initKVBlock() {
         malloc_info.reuse_cache         = false;
         malloc_info.enable_device_cache = false;
     } else {
-        malloc_info.reuse_cache         = reuseCache();
+        // Chunked prefill: later chunk rounds read the linear-attention state
+        // checkpoints at chunk boundaries, so those blocks must be
+        // materialized up front (the reuse-cache allocation policy).
+        malloc_info.reuse_cache         = reuseCache() || stream_->chunkedPrefillSize() > 0;
         malloc_info.enable_device_cache = reuseCache() && enableDeviceCache();
     }
     malloc_info.enable_remove_skipped_blocks = false;
@@ -437,7 +440,7 @@ absl::Status StreamCacheResource::incrKVBlock(int seq_len_override) {
     malloc_info.complete_token_ids           = stream_->completeTokenIdsPtr();
     malloc_info.request_id                   = stream_->streamId();
     malloc_info.verbose                      = malloc_failed_times_ >= 10 ? malloc_failed_times_ % 100 == 0 : true;
-    malloc_info.reuse_cache                  = reuseCache();
+    malloc_info.reuse_cache                  = reuseCache() || stream_->chunkedPrefillSize() > 0;
     malloc_info.enable_device_cache          = reuseCache() && enableDeviceCache();
     malloc_info.enable_remove_skipped_blocks = true;
     malloc_info.incr_seq_len_override        = seq_len_override;

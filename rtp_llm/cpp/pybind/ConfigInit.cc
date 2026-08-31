@@ -1300,6 +1300,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .def_readwrite("decode_prefill_ratio", &FIFOSchedulerConfig::decode_prefill_ratio)
         .def_readwrite("cp_force_single_prefill", &FIFOSchedulerConfig::cp_force_single_prefill)
         .def_readwrite("max_inited_kv_cache_streams", &FIFOSchedulerConfig::max_inited_kv_cache_streams)
+        .def_readwrite("enable_chunked_prefill", &FIFOSchedulerConfig::enable_chunked_prefill)
+        .def_readwrite("chunked_prefill_size", &FIFOSchedulerConfig::chunked_prefill_size)
         .def("to_string", &FIFOSchedulerConfig::to_string)
         .def(py::pickle(
             [](const FIFOSchedulerConfig& self) {
@@ -1308,10 +1310,12 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                                       self.pdfusion_scheduler_mode,
                                       self.decode_prefill_ratio,
                                       self.cp_force_single_prefill,
-                                      self.max_inited_kv_cache_streams);
+                                      self.max_inited_kv_cache_streams,
+                                      self.enable_chunked_prefill,
+                                      self.chunked_prefill_size);
             },
             [](py::tuple t) {
-                if (t.size() != 2 && t.size() != 4 && t.size() != 6)
+                if (t.size() != 2 && t.size() != 4 && t.size() != 6 && t.size() != 8)
                     throw std::runtime_error("Invalid state!");
                 FIFOSchedulerConfig c;
                 try {
@@ -1321,9 +1325,13 @@ PYBIND11_MODULE(libth_transformer_config, m) {
                         c.pdfusion_scheduler_mode = t[2].cast<std::string>();
                         c.decode_prefill_ratio    = t[3].cast<std::string>();
                     }
-                    if (t.size() == 6) {
+                    if (t.size() >= 6) {
                         c.cp_force_single_prefill     = t[4].cast<bool>();
                         c.max_inited_kv_cache_streams = t[5].cast<int64_t>();
+                    }
+                    if (t.size() == 8) {
+                        c.enable_chunked_prefill = t[6].cast<bool>();
+                        c.chunked_prefill_size   = t[7].cast<int64_t>();
                     }
                 } catch (const std::exception& e) {
                     throw std::runtime_error(std::string("FIFOSchedulerConfig unpickle error: ") + e.what());

@@ -2,6 +2,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <memory>
+#include <numeric>
 #include <ATen/Generator.h>
 #if defined(USING_CUDA) || defined(USING_ROCM)
 #include <ATen/cuda/CUDAGeneratorImpl.h>
@@ -9,6 +10,7 @@
 #include "autil/EnvUtil.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
+#include "rtp_llm/cpp/config/RoleTypes.h"
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
@@ -95,6 +97,45 @@ GenerateStream::GenerateStream(const shared_ptr<GenerateInput>& input,
     stream_cache_resource_->init(init_batch_size);
 
     setReturnAllProbs(generate_input_->generate_config->return_all_probs);
+
+    // Chunked prefill opt-in (fusion engine only). Disqualify features whose
+    // single-pass semantics chunking would break: actual multimodal inputs in
+    // the request (is_multimodal is a family flag and can be set for
+    // text-only requests), loss/prompt-logits over the full context, and
+    // beam/tiling output shapes.
+    if (runtime_config.fifo_scheduler_config.enable_chunked_prefill) {
+        const bool role_ok    = resource_context.role_type == RoleType::PDFUSION;
+        const bool mm_ok      = !generate_input_->multimodal_features.has_value()
+                           || generate_input_->multimodal_features->empty();
+        const bool beam_ok    = !hasNumBeams();
+        const bool nrs_ok     = generate_input_->generate_config->num_return_sequences <= 1;
+        const bool loss_ok    = !generate_input_->generate_config->calculate_loss;
+        const bool plogits_ok = !generate_input_->generate_config->return_prompt_logits;
+        const bool hidden_ok  = !generate_input_->generate_config->return_all_hidden_states;
+        const bool sprobs_ok  = !generate_input_->generate_config->return_softmax_probs;
+        const bool logits_ok  = !generate_input_->generate_config->return_logits;
+        if (role_ok && mm_ok && beam_ok && nrs_ok && loss_ok && plogits_ok && hidden_ok && sprobs_ok && logits_ok) {
+            chunked_prefill_size_ =
+                runtime_config.fifo_scheduler_config.chunked_prefill_size > 0
+                    ? static_cast<size_t>(runtime_config.fifo_scheduler_config.chunked_prefill_size) :
+                    static_cast<size_t>(8192);
+        }
+        RTP_LLM_LOG_INFO(
+            "[chunked-prefill] stream [%ld] enable=%d size=%zu (role=%d mm_input=%d beam=%d nrs=%d "
+            "loss=%d plogits=%d hidden=%d sprobs=%d logits=%d)",
+            streamId(),
+            chunked_prefill_size_ > 0,
+            chunked_prefill_size_,
+            static_cast<int>(resource_context.role_type),
+            !mm_ok,
+            hasNumBeams(),
+            generate_input_->generate_config->num_return_sequences,
+            generate_input_->generate_config->calculate_loss,
+            generate_input_->generate_config->return_prompt_logits,
+            generate_input_->generate_config->return_all_hidden_states,
+            generate_input_->generate_config->return_softmax_probs,
+            generate_input_->generate_config->return_logits);
+    }
 
     auto processors_result = LogitsProcessorFactory::createLogitsProcessors(
         generate_input_, init_batch_size, maxBatchSize(), special_tokens_.eos_token_id);
@@ -579,10 +620,51 @@ void GenerateStream::generateNextPositionId(int32_t* now_pos) {
 vector<int> GenerateStream::currentExecuteTokens(int batch_idx) const {
     // TODO(xinfei.sxf) 在query部分回退，重运行case下，这个不对
     if (isContextStream()) {
-        return complete_token_ids_->contextTokens(batch_idx, prefixLength(), contextLength());
+        int len = contextLength();
+        if (chunked_prefill_size_ > 0 && reserve_step_ == 0 && len > static_cast<int>(chunked_prefill_size_)) {
+            len = chunkRoundLen();
+        }
+        return complete_token_ids_->contextTokens(batch_idx, prefixLength(), len);
     } else {
         return complete_token_ids_->currentExecuteTokens(batch_idx);
     }
+}
+
+int GenerateStream::chunkRoundLen() const {
+    const int remaining = contextLength();
+    if (chunked_prefill_size_ == 0 || reserve_step_ > 0 || remaining <= static_cast<int>(chunked_prefill_size_)) {
+        return remaining;
+    }
+    // Intermediate chunk bounds must land on a KV state-checkpoint boundary
+    // (seqSizePerBlock) and on the FLA kernel's 64-token tile grid so the next
+    // round's prefix continuation matches a single-pass prefill numerically.
+    const int spb  = std::max(1, seqSizePerBlock());
+    const int unit = std::lcm(spb, 64);
+    return std::max(unit, static_cast<int>(chunked_prefill_size_) / unit * unit);
+}
+
+bool GenerateStream::isChunkedPrefillContext() const {
+    return chunked_prefill_size_ > 0 && reserve_step_ == 0 && isContextStream();
+}
+
+bool GenerateStream::isChunkedPrefillMid() const {
+    return isChunkedPrefillContext() && contextLength() > chunkRoundLen();
+}
+
+void GenerateStream::advanceChunkedPrefill() {
+    std::lock_guard<std::mutex> lock(*mutex_);
+    const int round_len = chunkRoundLen();
+    if (round_len <= 0) {
+        return;
+    }
+    // The executed slice becomes attention prefix (and GDN/conv state
+    // checkpoint position) for the next round.
+    setReuseLength(reuseLength() + round_len);
+    RTP_LLM_LOG_INFO("[chunked-prefill] stream [%ld] chunk [%d] done, prefix [%d], remaining [%d]",
+                     streamId(),
+                     round_len,
+                     reuseLength(),
+                     contextLength());
 }
 
 void GenerateStream::step() {

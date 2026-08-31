@@ -24,6 +24,23 @@ def init_fifo_scheduler_group_args(parser, fifo_scheduler_config):
         help="最大 batch tokens 大小。",
     )
     fifo_scheduler_group.add_argument(
+        "--enable_chunked_prefill",
+        env_name="ENABLE_CHUNKED_PREFILL",
+        bind_to=[(fifo_scheduler_config, "enable_chunked_prefill")],
+        type=str2bool,
+        default=False,
+        help="开启 chunked prefill：超过 chunked_prefill_size 的 prompt 分多个调度轮执行，"
+        "每轮以自身前缀续算（限制单轮激活/workspace 显存，解锁超长 prefill）。",
+    )
+    fifo_scheduler_group.add_argument(
+        "--chunked_prefill_size",
+        env_name="CHUNKED_PREFILL_SIZE",
+        bind_to=[(fifo_scheduler_config, "chunked_prefill_size")],
+        type=int,
+        default=0,
+        help="chunked prefill 单轮 token 上限；0 表示使用默认 8192。中间块按 block/FLA tile 对齐向下取整。",
+    )
+    fifo_scheduler_group.add_argument(
         "--pdfusion_scheduler_mode",
         env_name="PDFUSION_SCHEDULER_MODE",
         bind_to=[(fifo_scheduler_config, "pdfusion_scheduler_mode")],

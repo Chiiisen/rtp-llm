@@ -137,6 +137,16 @@ void GenerateStateMachine::handleRunning() {
         releaseResource();
         return;
     }
+    // Chunked prefill: blocks for the full context were allocated up front at
+    // initKVBlock; no incremental allocation while the stream is a chunked
+    // context stream — the linear-attention group's removeSkippedBlocks would
+    // otherwise reclaim the state-checkpoint blocks later chunks read.
+    auto* chunked_stream = stream_cache_resource_->stream();
+    if (chunked_stream != nullptr && chunked_stream->isChunkedPrefillContext()) {
+        chunked_stream->recordRunningTime();
+        status.store(StreamState::RUNNING, std::memory_order_release);
+        return;
+    }
     if (stream_cache_resource_->resourceContext().role_type == RoleType::PREFILL
         && stream_cache_resource_->isContextStream()) {
         return;

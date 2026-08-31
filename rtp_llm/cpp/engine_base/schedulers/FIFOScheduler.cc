@@ -59,12 +59,18 @@ bool FIFOScheduler::evaluateRunningMemory(const list<GenerateStreamPtr>& streams
         return false;
     }
 
-    int max_token_size = new_stream->contextLength();
+    // Chunked prefill: a context stream's per-round token footprint is its
+    // chunk slice, not its full context (chunkRoundLen falls back to
+    // contextLength when chunking is disabled or this is the final chunk).
+    int max_token_size =
+        new_stream->isContextStream() ? new_stream->chunkRoundLen() : new_stream->contextLength();
     if (streams.empty() && max_token_size + running_streams_.size() < int(max_seq_len_)) {
         return true;
     }
     for (auto& stream : streams) {
-        max_token_size = std::max(max_token_size, stream->contextLength());
+        const int stream_token_size =
+            stream->isContextStream() ? stream->chunkRoundLen() : stream->contextLength();
+        max_token_size = std::max(max_token_size, stream_token_size);
     }
     // 这里的判断是要求当前调度轮所有请求参与计算的 token 数之和小于 max_batch_tokens_size_，loading_cache_streams
     // 这一轮实际不参与计算，不需要计入。

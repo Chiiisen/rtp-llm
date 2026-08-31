@@ -183,6 +183,28 @@ public:
     int nextBatchSize() const;
     int maxBatchSize() const;
 
+    // ---- Chunked prefill (fusion engine) ----
+    // An oversized context stream executes in multiple scheduler rounds; each
+    // round is a context pass whose attention prefix is the stream's own
+    // earlier chunks (same paged-prefix path as prefix caching, including the
+    // per-block GDN/conv state checkpoints). 0 disables chunking.
+    size_t chunkedPrefillSize() const {
+        return chunked_prefill_size_;
+    }
+    // Tokens the current context round executes (full remaining context when
+    // chunking is disabled or this is the final chunk).
+    int  chunkRoundLen() const;
+    // True while the stream is a chunked context stream (any chunk round,
+    // including the final one). Such streams keep their up-front block table:
+    // incrKVBlock must not run, or the linear-attention group reclaims the
+    // intermediate state-checkpoint blocks the next chunk round reads.
+    bool isChunkedPrefillContext() const;
+    // True while at least one more chunk round remains after the current one.
+    bool isChunkedPrefillMid() const;
+    // Commit one finished chunk round: the executed slice becomes attention
+    // prefix for the next round.
+    void advanceChunkedPrefill();
+
     int  numBeams(int output_len) const;
     int  currentNumBeams() const;
     int  nextNumBeams() const;
@@ -837,6 +859,7 @@ protected:
     int                                sp_edit_search_index_ = 0;
     bool                               sp_edit_first_time_   = true;
     bool                               sp_edit_run_          = false;
+    size_t                             chunked_prefill_size_ = 0;
     std::vector<int>                   propose_token_;
     bool                               contain_propose_token_ = false;
     int                                mtp_token_index_       = 0;

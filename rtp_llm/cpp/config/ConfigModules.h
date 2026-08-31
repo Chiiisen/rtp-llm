@@ -358,6 +358,12 @@ PDFusionSchedulerMode parsePDFusionSchedulerMode(const std::string& mode);
 struct FIFOSchedulerConfig {
     int64_t max_context_batch_size = 1;
     int64_t max_batch_tokens_size  = 0;
+    // Chunked prefill (fusion engine): context streams whose remaining context
+    // exceeds chunked_prefill_size execute in multiple scheduler rounds; each
+    // round is a context pass whose prefix is the stream's own earlier chunks.
+    // 0 means "use 8192" when enabled (engine_config.py resolves the default).
+    bool    enable_chunked_prefill = false;
+    int64_t chunked_prefill_size   = 0;
     // PDFUSION scheduler mode. Supported values:
     //   ""      -> default FIFO/decode-first scheduler
     //   "ratio" -> PDFusionRatioScheduler with decode_prefill_ratio

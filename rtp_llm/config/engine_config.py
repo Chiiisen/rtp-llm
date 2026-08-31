@@ -334,6 +334,13 @@ def finalize_scheduler_config(
         fifo_scheduler_config.max_batch_tokens_size = (
             fifo_scheduler_config.max_context_batch_size * max_seq_len
         )
+
+    # Chunked prefill default chunk size
+    if (
+        getattr(fifo_scheduler_config, "enable_chunked_prefill", False)
+        and getattr(fifo_scheduler_config, "chunked_prefill_size", 0) <= 0
+    ):
+        fifo_scheduler_config.chunked_prefill_size = 8192
     logging.info(
         f"max_batch_tokens_size: {fifo_scheduler_config.max_batch_tokens_size}"
     )
