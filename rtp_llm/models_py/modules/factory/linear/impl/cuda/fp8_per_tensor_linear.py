@@ -39,6 +39,10 @@ class CudaFp8PerTensorLinear(LinearBase):
             "FP8_PER_TENSOR_COMPRESSED",
             "FP8_DYNAMIC_PER_TENSOR",
             "FP8",
+            # ModelOpt mixed-precision NVFP4 checkpoints: the non-expert
+            # modules are static per-tensor FP8 (W8A8) with scalar
+            # weight_scale / input_scale (loaded by MixedModelOptFp8Weight).
+            "modelopt_mixed",
             # "W4A8_INT4_PER_CHANNEL",
         ]
 

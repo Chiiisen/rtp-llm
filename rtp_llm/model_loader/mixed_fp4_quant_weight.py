@@ -3,7 +3,12 @@ import copy
 from typing import Any, List, Dict, Union
 import torch
 
-from rtp_llm.config.quant_config import ModelOptFp4Config, MXFp4QuarkQuantConfig, QuantizationConfig
+from rtp_llm.config.quant_config import (
+    ModelOptFp4Config,
+    ModelOptMixedFp4Config,
+    MXFp4QuarkQuantConfig,
+    QuantizationConfig,
+)
 from rtp_llm.model_loader.attn_weight import AttnAtomicWeight
 from rtp_llm.model_loader.load_config import LoadConfig
 from rtp_llm.model_loader.ffn_weight import FfnAtomicWeight, MoeAtomicWeight
@@ -132,6 +137,30 @@ def create_mixed_fp4_per_group_weight(
     raise NotImplementedError(f"Unsupported weight type: {src_weight_info}")
 
 
+def _is_excluded_from_quant(src_weight_info, exclude_modules: set) -> bool:
+    """True if any ckpt tensor of this weight matches a quant exclusion pattern.
+
+    exclude_modules entries are compressed-tensors "ignore" globs such as
+    ``model.language_model.layers.0.mlp.shared_expert*``. Ckpt names are layer
+    templates with ``{i}``, so we sample a few concrete layer indices and glob
+    -match each candidate against every exclusion pattern.
+    """
+    if not exclude_modules:
+        return False
+    import fnmatch
+
+    for w in getattr(src_weight_info, "weights", []):
+        template = w.name
+        candidates = (
+            [template] if "{i}" not in template else
+            [template.replace("{i}", str(i)) for i in (0, 1, 2)]
+        )
+        for cand in candidates:
+            if any(fnmatch.fnmatch(cand, pat) for pat in exclude_modules):
+                return True
+    return False
+
+
 class MixedFp4Weight(CompositeWeight, QuantWeight):
     w4a4_weight_list = {
         W.ffn_w1: W.ffn_s1,
@@ -173,6 +202,21 @@ class MixedFp4Weight(CompositeWeight, QuantWeight):
                 return False
             quark_quantized = {W.moe_w1, W.moe_w2}
             return name in cls.unquantized_weight_list or name in quark_quantized
+        if isinstance(quant_config, ModelOptMixedFp4Config):
+            # ModelOpt mixed (modelopt_mixed): this loader handles the NVFP4
+            # routed experts only. FP8 modules (attention / linear-attn /
+            # shared experts) are claimed by PerChannelFp8Weight; `ignore`
+            # modules stay plain (BF16).
+            return name in (W.moe_w1, W.moe_w2) and not _is_excluded_from_quant(
+                src_weight_info, quant_config.exclude_modules
+            )
+        if isinstance(quant_config, ModelOptFp4Config) and _is_excluded_from_quant(
+            src_weight_info, quant_config.exclude_modules
+        ):
+            # Compressed-tensors "ignore" (exclude_modules): the module is kept in
+            # high precision (BF16) in the checkpoint, so it must not be wrapped by
+            # the FP4 quant weight (which requires weight_scale/weight_scale_2).
+            return False
         return (name in cls.unquantized_weight_list or name in cls.w4a4_weight_list) and quant_config.mixed_attention
                 
 

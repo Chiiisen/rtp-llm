@@ -61,7 +61,16 @@ class MoeConfigResolver:
         """
         if config.model_config.quant_config is None:
             return None
-        return config.model_config.quant_config.get_method()
+        method = config.model_config.quant_config.get_method()
+        # ModelOpt mixed-precision checkpoints (quant_method "modelopt_mixed",
+        # e.g. nvidia Qwen3.5-397B-A17B-NVFP4-V2): the routed experts are
+        # NVFP4 (ModelOpt FP4, W4A4 group-16) while other modules are FP8.
+        # MoE strategy selection keys on the *expert* weights' quant method,
+        # so report the FP4 method here (get_method() stays "modelopt_mixed"
+        # for the linear/FP8-loader dispatch).
+        if method == "modelopt_mixed":
+            return "modelopt_fp4"
+        return method
 
     @staticmethod
     def is_ep_enabled(config: MoEConfigAdapter) -> bool:

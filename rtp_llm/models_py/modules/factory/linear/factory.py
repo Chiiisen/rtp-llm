@@ -173,7 +173,17 @@ class LinearFactory:
         merged_scales = None
         if (use_fp8 or use_fp4) and scale_keys:
             scale_tensors = [weights[key] for key in scale_keys]
-            merged_scales = torch.cat(scale_tensors, dim=dim)
+            if use_fp8 and all(
+                s.dim() == 2 and s.shape[1] == 1 and s.shape[0] > 1
+                for s in scale_tensors
+            ):
+                # Per-channel FP8 scales are [N, 1] column vectors: stack them
+                # along the output dim so they line up with the merged weight's
+                # concatenated output channels (cat along `dim=-1` would
+                # interleave the two modules' channels).
+                merged_scales = torch.cat(scale_tensors, dim=0)
+            else:
+                merged_scales = torch.cat(scale_tensors, dim=dim)
 
         # Merge bias if exists
         merged_bias = None
@@ -236,6 +246,7 @@ class LinearFactory:
             "FP8_PER_CHANNEL_QUARK",
             "FP8_PER_TENSOR_COMPRESSED",
             "FP8_PER_BLOCK_QUARK",
+            "modelopt_mixed",
         ]
         if quant_method not in fp8_methods:
             return False

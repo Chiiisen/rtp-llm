@@ -254,7 +254,7 @@ class QuantizationConfig(ABC):
                     full_attention_interval = text_config.get("full_attention_interval", 0)
                     if full_attention_interval != 0:
                         mixed_attention = True
-                return ModelOptFp4Config.from_config(
+                fp4_config = ModelOptFp4Config.from_config(
                     {
                         "bits": bits,
                         "method": quant_method,
@@ -263,7 +263,49 @@ class QuantizationConfig(ABC):
                         "mixed_attention": mixed_attention,
                     }
                 )
-            
+                # Compressed-tensors "ignore" lists modules kept in high precision
+                # (e.g. nv-community NVFP4 checkpoints keep shared_expert BF16).
+                # Propagate as exclude_modules so quant weight factories can skip them.
+                fp4_config.exclude_modules = set(quant_config.get("ignore", []))
+                return fp4_config
+
+        if quant_method == "modelopt_mixed":
+            # ModelOpt MIXED_PRECISION (e.g. nvidia Qwen3.5-397B-A17B-NVFP4-V2):
+            # multiple config_groups; routed experts are NVFP4 group-16, other
+            # quantized modules are FP8 per-channel, `ignore` modules stay BF16.
+            fp4_targets: set = set()
+            fp8_targets: set = set()
+            fp4_group_size = 16
+            for group in quant_config.get("config_groups", {}).values():
+                weights_cfg = group.get("weights", {})
+                if weights_cfg.get("type") != "float":
+                    continue
+                num_bits = weights_cfg.get("num_bits")
+                targets = group.get("targets", [])
+                if num_bits == 4:
+                    fp4_group_size = weights_cfg.get("group_size", 16)
+                    fp4_targets.update(targets)
+                elif num_bits == 8:
+                    fp8_targets.update(targets)
+            text_config = config_json.get("text_config", None)
+            mixed_attention = False
+            if text_config is not None:
+                full_attention_interval = text_config.get("full_attention_interval", 0)
+                if full_attention_interval != 0:
+                    mixed_attention = True
+            mixed_config = ModelOptMixedFp4Config(
+                bits=4,
+                group_size=fp4_group_size,
+                is_quanted=True,
+                mixed_attention=mixed_attention,
+                fp4_targets=fp4_targets,
+                fp8_targets=fp8_targets,
+            )
+            # Preserve `ignore` globs verbatim (including `re:` patterns): weight
+            # loaders skip these modules, and the MTP draft builder probes them
+            # with fnmatch to detect BF16 draft weights.
+            mixed_config.exclude_modules = set(quant_config.get("ignore", []))
+            return mixed_config
 
         result = cls.from_config(
             {
@@ -708,6 +750,32 @@ class ModelOptFp4Config(QuantizationConfig):
     @classmethod
     def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
         return ModelOptFp4Config(**config)
+
+
+class ModelOptMixedFp4Config(ModelOptFp4Config):
+    """Config for ModelOpt mixed-precision NVFP4 checkpoints (modelopt_mixed).
+
+    E.g. nvidia Qwen3.5-397B-A17B-NVFP4-V2: routed MoE experts are NVFP4
+    (W4A4, group 16) while attention / linear-attention / shared-expert
+    modules are FP8 (W8A8 per-channel static); `ignore` modules stay BF16.
+    get_algo() keeps the ModelOptFP4 value so the C++ QuantAlgo gate accepts it.
+    """
+
+    def __init__(self, bits: int, group_size: int, is_quanted: bool, **kwargs: Any):
+        super().__init__(bits=bits, group_size=group_size, is_quanted=is_quanted, **kwargs)
+        # Concrete ckpt module paths (from quantization_config.config_groups
+        # targets): fp4_targets are routed-expert modules, fp8_targets are the
+        # per-channel FP8 modules. Weight loaders use them to dispatch.
+        self.fp4_targets: set = set(kwargs.get("fp4_targets", set()))
+        self.fp8_targets: set = set(kwargs.get("fp8_targets", set()))
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "modelopt_mixed"
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return ModelOptMixedFp4Config(**config)
 
 
 class W4a8Int4PerChannelQuantConfig(QuantizationConfig):
