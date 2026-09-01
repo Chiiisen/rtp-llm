@@ -79,35 +79,15 @@ class CausalAttention(nn.Module):
         kv_cache: Optional[LayerKVCache],
         gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        import os
-        _nan_probe = os.environ.get("RTP_LLM_NAN_DEBUG") in ("1", "2") and (hidden_states.shape[0] > 1 or os.environ.get("RTP_LLM_NAN_DEBUG") == "2")
         input_shape = hidden_states.shape[:-1]
         qkv = self.qkv_proj(hidden_states)
-        if _nan_probe and (~torch.isfinite(qkv)).any().item():
-            import logging
-            logging.getLogger("nan_debug").warning(
-                f"[nan-probe] L{self.layer_idx} attn qkv NONFINITE batch={qkv.shape[0]} "
-                f"nan={torch.isnan(qkv).sum().item()} inf={torch.isinf(qkv).sum().item()}"
-            )
         if self.qk_fuse_norm is not None:
             qkv = self.qk_fuse_norm(qkv)
         attn_output = fmha_impl.forward(qkv, kv_cache, self.layer_idx)
-        if _nan_probe and (~torch.isfinite(attn_output)).any().item():
-            import logging
-            logging.getLogger("nan_debug").warning(
-                f"[nan-probe] L{self.layer_idx} attn FMHA OUTPUT NONFINITE batch={attn_output.shape[0]} "
-                f"nan={torch.isnan(attn_output).sum().item()} inf={torch.isinf(attn_output).sum().item()}"
-            )
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)
         output = self.o_proj(attn_output)
-        if _nan_probe and (~torch.isfinite(output)).any().item():
-            import logging
-            logging.getLogger("nan_debug").warning(
-                f"[nan-probe] L{self.layer_idx} attn o_proj OUT NONFINITE batch={output.shape[0]} "
-                f"nan={torch.isnan(output).sum().item()} inf={torch.isinf(output).sum().item()}"
-            )
         if self.tp_size > 1:
             output = all_reduce(output, group=Group.TP)
         return output
