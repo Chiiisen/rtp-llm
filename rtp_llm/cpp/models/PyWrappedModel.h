@@ -98,8 +98,12 @@ private:
     torch::Tensor                   tensorHoldHostAndToCuda(const torch::Tensor& tensor);
 
     // Methods absorbed from GptModel
-    torch::Tensor   tpSyncEmbeddingOrLogits(const torch::Tensor& input);
-    torch::Tensor   computeQuantizedLogits(const torch::Tensor& hidden);
+    torch::Tensor tpSyncEmbeddingOrLogits(const torch::Tensor& input);
+    torch::Tensor computeQuantizedLogits(const torch::Tensor& hidden);
+    // LM head matmul only (TP-local logits, no gather). Shared by lmHeadLogits and by the
+    // prompt-scoring row-selection path, which gathers only the consumer-visible rows.
+    torch::Tensor
+    lmHeadLocalLogits(const torch::Tensor& last_hidden, const torch::Tensor& lm_head_kernel, bool* int8_used_out);
     // LM head matmul + TP logits gather. With RTP_LLM_INT8_LM_HEAD=1 and a bf16 head, calls with
     // M <= 8 rows run a weight-only INT8 GEMV (per-row scale) on a copy quantized at first use.
     // RTP_LLM_INT8_LM_HEAD_CHECK=1 additionally runs the bf16 head, serves the bf16 logits and
@@ -264,10 +268,10 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
         RTP_LLM_LOG_ERROR("Python model initialize failed:\n%s", e.what());
         throw;
     }
-    const char* forward_method     = dspark_model_role_ == DSparkModelRole::PROPOSE ? "forward_propose" :
-                                     dspark_model_role_ == DSparkModelRole::COMMIT  ? "forward_commit" :
-                                                                                      "forward";
-    py_forward_method_             = py_model_.attr(forward_method);
+    const char* forward_method = dspark_model_role_ == DSparkModelRole::PROPOSE ? "forward_propose" :
+                                 dspark_model_role_ == DSparkModelRole::COMMIT  ? "forward_commit" :
+                                                                                  "forward";
+    py_forward_method_         = py_model_.attr(forward_method);
     if (weights_.lm_head && weights_.lm_head->kernel.dtype() == torch::kUInt8) {
         RTP_LLM_CHECK_WITH_INFO(py::hasattr(py_model_, "compute_quantized_logits"),
                                 "Packed LM head requires Python compute_quantized_logits");

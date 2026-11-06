@@ -75,6 +75,8 @@ GptModelInputShapeHints getModelInputShapeHints(const GptModelInputs& inputs) {
     shape_hints[GptModelInputIndex::isFakeStream] = inputs.is_fake_stream;
     shape_hints[GptModelInputIndex::mtpHiddenStatesRows] =
         inputs.last_hidden_states.defined() ? inputs.last_hidden_states.size(0) : 0;
+    shape_hints[GptModelInputIndex::allLogitsRowIndexes] =
+        inputs.all_logits_row_indexes.defined() ? inputs.all_logits_row_indexes.numel() : 0;
 
     // encode root-side tensor device for fields that may live on GPU on the
     // PDFUSION fast path, so non-root ranks can allocate matching GPU buffers
@@ -296,6 +298,13 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         inputs.lm_output_indexes     = allocBuf(rtp_llm::DataType::TYPE_INT32,
                                                 {checkedHint(GptModelInputIndex::lmOutputIndexes, "lmOutputIndexes")},
                                             pickAlloc(GptModelInputDeviceBit::kDeviceBitLmOutputIndexes));
+        if (inputs.need_all_logits) {
+            // Keep definedness in lockstep with the root rank (which attaches a possibly-empty
+            // tensor iff need_all_logits): the PyWrappedModel row-select decision keys off
+            // defined() and must agree across ranks or the TP all-gather sizes would diverge.
+            inputs.all_logits_row_indexes =
+                allocBuf(rtp_llm::DataType::TYPE_INT32, {shape_hints_ptr[GptModelInputIndex::allLogitsRowIndexes]});
+        }
         if (combo_position_ids_size) {
             inputs.combo_position_ids = allocBuf(rtp_llm::DataType::TYPE_INT32, {combo_position_ids_size});
         }
@@ -373,6 +382,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
     collect(inputs.request_id);
     collect(inputs.request_pd_separation);
     collect(inputs.lm_output_indexes);
+    collect(inputs.all_logits_row_indexes);
     if (combo_position_ids_size) {
         collect(inputs.combo_position_ids);
     }

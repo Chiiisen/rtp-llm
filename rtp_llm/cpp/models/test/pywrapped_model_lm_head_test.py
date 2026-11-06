@@ -4,9 +4,9 @@ from unittest.mock import Mock
 import torch
 from torch import nn
 
+from rtp_llm.cpp.models.test.libth_pywrapped_model_lm_head_test import run_lm_head
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
 from rtp_llm.ops.compute_ops import clear_comm_ops, register_comm_ops
-from rtp_llm.cpp.models.test.libth_pywrapped_model_lm_head_test import run_lm_head
 
 
 class ProjectionModel(GptModelBase):
@@ -143,6 +143,73 @@ class PyWrappedModelLmHeadTest(unittest.TestCase):
             self.assertEqual(communicated[0].dtype, torch.bfloat16)
             expected = torch.cat((local, local + 16), dim=1)[:, :29].float()
             torch.testing.assert_close(result["logits"], expected)
+        finally:
+            clear_comm_ops()
+
+    def test_row_selected_all_logits_gather(self):
+        # need_all_logits with explicit row indexes: the local lm head runs the full GEMM
+        # (bitwise-identical local logits), then only [lm rows ++ scoring rows] are kept
+        # for the (TP) gather.
+        scoring = torch.tensor([0, 2, 3], dtype=torch.int32, pin_memory=True)
+        with torch.no_grad():
+            result = run_lm_head(
+                self.model,
+                self.packed,
+                self.hidden,
+                self.indexes,
+                need_all_logits=True,
+                all_logits_row_indexes=scoring,
+                output_vocab_size=13,
+            )
+        full = self.model.nvfp4_lm_head(self.hidden).float()[:, :13]
+        # rows = indexes([5,1]) ++ scoring([0,2,3]) = [5,1,0,2,3]
+        expected_all = full[[5, 1, 0, 2, 3]]
+        torch.testing.assert_close(result["all_logits"], expected_all)
+        torch.testing.assert_close(result["logits"], full[[5, 1]])
+        self.assertEqual(result["all_logits_lm_rows"], 2)
+        # hidden_states/all_hidden_states keep the legacy full-sequence contract.
+        torch.testing.assert_close(result["hidden_states"], self.hidden)
+        torch.testing.assert_close(result["all_hidden_states"], self.hidden)
+        # The projection ran on all 6 token rows (full GEMM, select-after-mm).
+        self.assertEqual(self.model.projected_rows[-1], 6)
+
+    def test_row_selected_tp_gather_sends_only_needed_rows(self):
+        gathered_shapes = []
+
+        def gather(receivers, mode, senders, inplace):
+            buffer = receivers[0]
+            rows = buffer.shape[0]
+            gathered_shapes.append(tuple(buffer.shape))
+            local = buffer.reshape(2, rows, 16)[0].clone()
+            buffer.reshape(2, rows, 16).copy_(torch.stack((local, local + 16)))
+
+        register_comm_ops(lambda *args: None, lambda *args: None, gather)
+        try:
+            scoring = torch.tensor([4], dtype=torch.int32, pin_memory=True)
+            with torch.no_grad():
+                result = run_lm_head(
+                    self.model,
+                    self.packed,
+                    self.hidden,
+                    self.indexes,
+                    need_all_logits=True,
+                    all_logits_row_indexes=scoring,
+                    tp_size=2,
+                    output_vocab_size=29,
+                )
+            # 2 lm rows + 1 scoring row -> one 3-row gather, not 6 rows.
+            self.assertEqual(gathered_shapes, [(3, 32)])
+            local = self.model.nvfp4_lm_head(self.hidden[[5, 1, 4]]).float()
+            expected = torch.cat(
+                (
+                    self.model.nvfp4_lm_head(self.hidden[[5, 1, 4]]),
+                    self.model.nvfp4_lm_head(self.hidden[[5, 1, 4]]) + 16,
+                ),
+                dim=1,
+            )[:, :29].float()
+            torch.testing.assert_close(result["all_logits"], expected)
+            torch.testing.assert_close(result["logits"], expected[:2])
+            self.assertEqual(result["all_logits_lm_rows"], 2)
         finally:
             clear_comm_ops()
 

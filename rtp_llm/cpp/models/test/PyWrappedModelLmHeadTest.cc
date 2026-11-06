@@ -17,12 +17,13 @@ py::dict runLmHead(py::object           py_model,
                    bool                 need_all_logits,
                    bool                 already_selected,
                    int                  tp_size,
-                   size_t               output_vocab_size) {
+                   size_t               output_vocab_size,
+                   const py::object&    all_logits_row_indexes) {
     initRuntime(/*device_id=*/0, /*trace_memory=*/false, /*enable_comm_overlap=*/false, MlaOpsType::AUTO);
     Weights weights;
     weights.layers.resize(1);
-    auto head      = std::make_shared<DenseWeights>();
-    head->kernel   = kernel;
+    auto head       = std::make_shared<DenseWeights>();
+    head->kernel    = kernel;
     weights.lm_head = std::move(head);
 
     GptModelDescription description;
@@ -31,20 +32,24 @@ py::dict runLmHead(py::object           py_model,
     description.attention_conf.head_num      = 1;
     description.attention_conf.kv_head_num   = 1;
     description.attention_conf.size_per_head = hidden.size(1);
-    description.output_vocab_size           = output_vocab_size;
-    description.output_vocab_padded_size    = kernel.size(0) * tp_size;
+    description.output_vocab_size            = output_vocab_size;
+    description.output_vocab_padded_size     = kernel.size(0) * tp_size;
 
     GptModelInitParams params{weights, description, std::nullopt};
-    params.parallelism_config.tp_size                = tp_size;
-    params.hw_kernel_config.enable_cuda_graph        = false;
-    params.profile_debug_logging_config.check_nan    = true;
-    params.hidden_size                               = hidden.size(1);
-    params.max_seq_len                               = 64;
+    params.parallelism_config.tp_size             = tp_size;
+    params.hw_kernel_config.enable_cuda_graph     = false;
+    params.profile_debug_logging_config.check_nan = true;
+    params.hidden_size                            = hidden.size(1);
+    params.max_seq_len                            = 64;
 
     PyWrappedModel model(params, std::move(py_model));
     GptModelInputs inputs;
-    auto outputs = already_selected ? model.forwardPostLayersLastHidden(hidden, inputs) :
-                                      model.forwardPostLayers(hidden,
+    inputs.need_all_logits = need_all_logits;
+    if (!all_logits_row_indexes.is_none()) {
+        inputs.all_logits_row_indexes = all_logits_row_indexes.cast<torch::Tensor>();
+    }
+    auto     outputs = already_selected ? model.forwardPostLayersLastHidden(hidden, inputs) :
+                                          model.forwardPostLayers(hidden,
                                                               has_context_request,
                                                               need_all_logits,
                                                               indexes,
@@ -54,10 +59,11 @@ py::dict runLmHead(py::object           py_model,
                                                               torch::Tensor(),
                                                               /*skip_final_layernorm=*/true);
     py::dict result;
-    result["logits"]            = outputs.logits;
-    result["hidden_states"]     = outputs.hidden_states;
-    result["all_hidden_states"] = outputs.all_hidden_states;
-    result["all_logits"]        = outputs.all_logits.defined() ? py::cast(outputs.all_logits) : py::none();
+    result["logits"]             = outputs.logits;
+    result["hidden_states"]      = outputs.hidden_states;
+    result["all_hidden_states"]  = outputs.all_hidden_states;
+    result["all_logits"]         = outputs.all_logits.defined() ? py::cast(outputs.all_logits) : py::none();
+    result["all_logits_lm_rows"] = outputs.all_logits_lm_rows;
     return result;
 }
 
@@ -70,9 +76,10 @@ PYBIND11_MODULE(libth_pywrapped_model_lm_head_test, m) {
           py::arg("kernel"),
           py::arg("hidden"),
           py::arg("indexes"),
-          py::arg("has_context_request") = true,
-          py::arg("need_all_logits")     = false,
-          py::arg("already_selected")    = false,
-          py::arg("tp_size")             = 1,
-          py::arg("output_vocab_size")   = 0);
+          py::arg("has_context_request")    = true,
+          py::arg("need_all_logits")        = false,
+          py::arg("already_selected")       = false,
+          py::arg("tp_size")                = 1,
+          py::arg("output_vocab_size")      = 0,
+          py::arg("all_logits_row_indexes") = py::none());
 }

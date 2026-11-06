@@ -418,4 +418,52 @@ TEST_F(NormalEngineTest, testAllowsUnsupportedCombosWithoutOutputVocab) {
     EXPECT_NO_THROW(createMockEngine(config));
 }
 
+TEST_F(NormalEngineTest, testScoringBatchForwardFailureFailsOnlyScoringStreams) {
+    CustomConfig config;
+    config.fail_scoring_batches = true;
+    auto engine                 = createMockEngine(config);
+
+    // A prompt-scoring request and a normal request enter the engine together. The mock model
+    // throws on any need_all_logits batch (as a CUDA OOM on the real model would); the guard must
+    // convert that into a request-level error for the scoring stream only.
+    std::shared_ptr<GenerateInput> scoring_query         = make_shared<GenerateInput>();
+    scoring_query->input_ids                             = torch::tensor({1, 2, 3, 4}, torch::kInt32);
+    scoring_query->generate_config                       = make_shared<GenerateConfig>();
+    scoring_query->generate_config->max_new_tokens       = 1;
+    scoring_query->generate_config->return_prompt_logits = true;
+
+    std::shared_ptr<GenerateInput> normal_query   = make_shared<GenerateInput>();
+    normal_query->input_ids                       = torch::tensor({5, 6, 7}, torch::kInt32);
+    normal_query->generate_config                 = make_shared<GenerateConfig>();
+    normal_query->generate_config->max_new_tokens = 2;
+
+    shared_ptr<GenerateStream> scoring_stream = engine->enqueue(scoring_query);
+    shared_ptr<GenerateStream> normal_stream  = engine->enqueue(normal_query);
+    ASSERT_TRUE(scoring_stream != nullptr);
+    ASSERT_TRUE(normal_stream != nullptr);
+
+    // The scoring request fails with a request-level allocation error instead of taking the
+    // engine loop down with the uncaught exception.
+    auto scoring_err = scoring_stream->nextOutput(30000);
+    ASSERT_FALSE(scoring_err.ok());
+    EXPECT_EQ(scoring_err.status().code(), ErrorCode::MALLOC_FAILED);
+
+    // The co-scheduled normal request is not taken down by the guard.
+    auto normal_out = normal_stream->nextOutput(30000);
+    ASSERT_TRUE(normal_out.ok());
+    EXPECT_EQ(normal_out.value().generate_outputs[0].aux_info.output_len, 2);
+    ASSERT_TRUE(normal_stream->hasEvent(StreamEvents::GenerateDone));
+
+    // A following normal request still works: the engine survived the aborted batch.
+    std::shared_ptr<GenerateInput> follow_query   = make_shared<GenerateInput>();
+    follow_query->input_ids                       = torch::tensor({1, 2}, torch::kInt32);
+    follow_query->generate_config                 = make_shared<GenerateConfig>();
+    follow_query->generate_config->max_new_tokens = 2;
+    shared_ptr<GenerateStream> follow_stream      = engine->enqueue(follow_query);
+    ASSERT_TRUE(follow_stream != nullptr);
+    auto follow_out = follow_stream->nextOutput(30000);
+    ASSERT_TRUE(follow_out.ok());
+    EXPECT_EQ(follow_out.value().generate_outputs[0].aux_info.output_len, 2);
+}
+
 }  // namespace rtp_llm

@@ -26,9 +26,13 @@ namespace rtp_llm {
 // Mock model that returns random logits for testing NormalEngine without Python
 class MockModel: public ModelBase {
 public:
-    MockModel(size_t vocab_size): vocab_size_(vocab_size) {}
+    MockModel(size_t vocab_size, bool fail_scoring_batches = false):
+        vocab_size_(vocab_size), fail_scoring_batches_(fail_scoring_batches) {}
 
     GptModelOutputs forward(const GptModelInputs& inputs) override {
+        if (fail_scoring_batches_ && inputs.need_all_logits) {
+            throw std::runtime_error("mock forward failure: CUDA out of memory in a scoring batch");
+        }
         GptModelOutputs outputs;
         // lm_output_indexes tells us how many logits rows to produce
         int64_t num_tokens = inputs.lm_output_indexes.defined() ? inputs.lm_output_indexes.size(0) : 1;
@@ -39,6 +43,7 @@ public:
 
 private:
     size_t vocab_size_;
+    bool   fail_scoring_batches_;
 };
 
 struct CustomConfig {
@@ -46,9 +51,10 @@ struct CustomConfig {
     DataType                                kv_cache_data_type = DataType::TYPE_FP16;
     std::map<std::string, std::vector<int>> multi_task_prompt_tokens;
     std::vector<int64_t>                    output_vocab_ids;  // non-empty enables output-vocab pruning
-    bool                                    prefill_cp_enabled  = false;
-    bool                                    speculative_enabled = false;
-    bool                                    warm_up_with_loss   = false;
+    bool                                    prefill_cp_enabled   = false;
+    bool                                    speculative_enabled  = false;
+    bool                                    warm_up_with_loss    = false;
+    bool                                    fail_scoring_batches = false;
 };
 
 inline void setDefaultMhaKVCacheSpecDescs(rtp_llm::ModelConfig& model_config) {
@@ -187,8 +193,9 @@ std::shared_ptr<NormalEngine> createMockEngine(const CustomConfig& config) {
     EngineInitParams rtp_llm_params = createEngineInitParams(config, model_config, runtime_config, kv_cache_config);
     // Set test model factory before engine construction so the model is available during startLoop()
     size_t vocab                       = model_config.vocab_size;
-    NormalExecutor::test_model_factory = [vocab](const GptModelInitParams&) {
-        return std::make_unique<MockModel>(vocab);
+    bool   fail_scoring                = config.fail_scoring_batches;
+    NormalExecutor::test_model_factory = [vocab, fail_scoring](const GptModelInitParams&) {
+        return std::make_unique<MockModel>(vocab, fail_scoring);
     };
     struct FactoryResetGuard {
         ~FactoryResetGuard() {

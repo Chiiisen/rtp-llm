@@ -4,10 +4,13 @@
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include <cstdlib>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <exception>
 #include <memory>
 #include <string>
 #include <thread>
+#include "rtp_llm/cpp/utils/ErrorCode.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "rtp_llm/cpp/models/ModelInputsLogger.h"
@@ -46,6 +49,44 @@ void holdSamplerInputHostBuffers(TensorHolder& holder, const SamplerInputs& inpu
     holder.hold_host(inputs.do_sample);
     holder.hold_host(inputs.finished_mask);
     holder.hold_host(inputs.cum_log_probs);
+}
+
+// need_all_logits is set only because some stream asked for prompt logits or per-token loss, and
+// that path materializes fp32 buffers of [scoring rows, vocab] (TP-gathered all_logits plus the
+// top-k / logsumexp / cross-entropy temporaries it feeds). A full-coverage request on a long
+// prompt can still exceed free GPU memory and throw; left uncaught the exception kills the engine
+// loop thread and with it the server. When that happens, fail just the streams that requested
+// those outputs — the aborted step produced no outputs, so every other stream is rescheduled
+// unchanged and the engine keeps serving. need_all_logits is taken from the (TP-synchronized)
+// model input so non-root ranks — which hold no stream objects — make the identical decision.
+// Returns false when the batch carried no scoring work; the caller must rethrow then (a scoring
+// guard is no excuse to swallow unrelated failures, and the previous crash behaviour is
+// preserved for them).
+bool failStreamsOnScoringError(const StreamGroups& stream_groups, bool need_all_logits, const std::exception& e) {
+    if (!need_all_logits) {
+        return false;
+    }
+    const char* what    = e.what();
+    std::string detail  = what == nullptr ? std::string() : std::string(what);
+    std::string lowered = detail;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    const bool is_oom = lowered.find("out of memory") != std::string::npos;
+    if (detail.size() > 512) {
+        detail.resize(512);
+        detail += "...";
+    }
+    RTP_LLM_LOG_ERROR("model step failed in a prompt-scoring batch; failing only the scoring "
+                      "request(s): %s",
+                      detail.c_str());
+    for (const auto& stream : stream_groups.allStreams()) {
+        if (stream->calculateLoss() || stream->returnPromptLogits()) {
+            stream->reportError(is_oom ? ErrorCode::MALLOC_FAILED : ErrorCode::EXECUTION_EXCEPTION,
+                                "prompt-scoring request aborted by model step failure: " + detail);
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -280,7 +321,14 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
             const auto role = is_propose_ ? ModelInputsModelRole::DRAFT : ModelInputsModelRole::NORMAL;
             model_inputs_logger_->log(model_input, role, model_->model_id_);
         }
-        model_output                        = std::move(model_->forward(model_input));
+        try {
+            model_output = std::move(model_->forward(model_input));
+        } catch (const std::exception& e) {
+            if (failStreamsOnScoringError(stream_groups, model_input.need_all_logits, e)) {
+                return absl::OkStatus();
+            }
+            throw;
+        }
         executor_collector.model_forward_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
     if (expert_balancer_) {
@@ -352,7 +400,8 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
                                    std::move(model_output),
                                    std::move(sampler_output),
                                    std::move(sampler_event),
-                                   profile_step_finish_);
+                                   profile_step_finish_,
+                                   model_input.need_all_logits);
     }
 
     {
@@ -362,7 +411,15 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         if (useDeviceInput()) {
             publishNormalDeviceState(stream_groups, merge_outputs.sampler_output);
         }
-        auto result                           = batch_stream_processor_->dispatch(stream_groups, merge_outputs);
+        absl::Status result;
+        try {
+            result = batch_stream_processor_->dispatch(stream_groups, merge_outputs);
+        } catch (const std::exception& e) {
+            if (failStreamsOnScoringError(stream_groups, model_input.need_all_logits, e)) {
+                return absl::OkStatus();
+            }
+            throw;
+        }
         executor_collector.dispatch_output_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
         int64_t tps_execute_time_us           = autil::TimeUtility::currentTimeInMicroSeconds() - schedule_time_us;
         if (tps_execute_time_us <= 0) {
@@ -687,7 +744,8 @@ absl::Status NormalExecutor::dispatchOutputAsync(const StreamGroups&           s
                                                  GptModelOutputs               model_output,
                                                  SamplerOutput                 sampler_output,
                                                  std::shared_ptr<torch::Event> sampler_event,
-                                                 std::function<void()>         profile_step_finish) {
+                                                 std::function<void()>         profile_step_finish,
+                                                 bool                          need_all_logits) {
     RTP_LLM_PROFILE_SCOPE("executor.dispatch_output_async");
 
     if (useDeviceInput()) {
@@ -710,7 +768,8 @@ absl::Status NormalExecutor::dispatchOutputAsync(const StreamGroups&           s
                              stream_groups_copy  = std::move(stream_groups_copy),
                              model_output_copy   = std::move(model_output_copy),
                              sampler_output_copy = std::move(sampler_output_copy),
-                             sampler_event]() mutable {
+                             sampler_event,
+                             need_all_logits]() mutable {
         RTP_LLM_PROFILE_SCOPE("executor.dispatch_output_worker");
 
         auto worker_streams = stream_groups_copy.allStreams();
@@ -740,8 +799,15 @@ absl::Status NormalExecutor::dispatchOutputAsync(const StreamGroups&           s
 #endif
         }
 
-        auto status =
-            processor->dispatch(stream_groups_copy, {std::move(model_output_copy), std::move(sampler_output_copy)});
+        absl::Status status;
+        try {
+            status =
+                processor->dispatch(stream_groups_copy, {std::move(model_output_copy), std::move(sampler_output_copy)});
+        } catch (const std::exception& e) {
+            if (!failStreamsOnScoringError(stream_groups_copy, need_all_logits, e)) {
+                throw;
+            }
+        }
         if (!status.ok()) {
             RTP_LLM_LOG_ERROR("[normal-stream-async] dispatch (worker) failed: %s", status.ToString().c_str());
         }
